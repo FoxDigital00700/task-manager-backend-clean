@@ -29,6 +29,8 @@ const allowedOrigins = [
   "http://localhost:5173",
   "http://localhost:3000",
   "https://loquacious-phoenix-c65c47.netlify.app",
+  "https://rainbow-hotteok-54f56b.netlify.app",
+  "https://spectacular-horse-39cb30.netlify.app",
   process.env.CLIENT_URL, // Allow dynamic client URL from env
 ];
 
