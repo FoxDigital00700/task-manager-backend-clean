@@ -1,0 +1,735 @@
+import Task from "../models/Task.js";
+import mongoose from "mongoose";
+import axios from "axios";
+import User from "../models/User.js";
+import WorkLog from "../models/WorkLog.js";
+import path from "path";
+import { fileURLToPath } from "url";
+import fs from "fs";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// @desc    Create a new task
+// @route   POST /api/tasks
+// @access  Public (Should be Admin)
+export const createTask = async (req, res) => {
+    try {
+        console.log("createTask called. Body:", req.body);
+        console.log("createTask called. Files:", req.files);
+        const {
+            projectName,
+            taskTitle,
+            description,
+            workCategory,
+            roles, // Array from JSON.parse (handled below)
+            assignType,
+            assignee, // Can be array of IDs (Single) or Dept Names (Department)
+            priority,
+            startDate,
+            startTime,
+            deadline,
+        } = req.body;
+
+        // Parse parsedRoles
+        let parsedRoles = [];
+        if (typeof roles === 'string') {
+            try {
+                parsedRoles = JSON.parse(roles);
+            } catch (e) {
+                parsedRoles = [];
+            }
+        } else if (Array.isArray(roles)) {
+            parsedRoles = roles;
+        }
+
+        // Parse assignee (similar to roles, to handle FormData stringification)
+        let parsedAssignee = [];
+        if (typeof assignee === 'string') {
+            try {
+                parsedAssignee = JSON.parse(assignee);
+            } catch (e) {
+                // If parsing fails, maybe it's a single raw string? Treat as single item array.
+                parsedAssignee = [assignee];
+            }
+        } else if (Array.isArray(assignee)) {
+            parsedAssignee = assignee;
+        } else if (assignee) {
+            parsedAssignee = [assignee];
+        }
+
+        // Parse projectLead
+        let parsedProjectLead = [];
+        if (req.body.projectLead) {
+            if (typeof req.body.projectLead === 'string') {
+                try {
+                    parsedProjectLead = JSON.parse(req.body.projectLead);
+                } catch (e) {
+                    parsedProjectLead = [req.body.projectLead]; // Fallback
+                }
+            } else if (Array.isArray(req.body.projectLead)) {
+                parsedProjectLead = req.body.projectLead;
+            }
+        }
+
+        // Ensure it is an array
+        if (!Array.isArray(parsedProjectLead)) {
+            parsedProjectLead = [];
+        }
+
+        // Filter: Must be non-empty string AND valid ObjectId
+        parsedProjectLead = parsedProjectLead.filter(id => id && typeof id === 'string' && id.trim() !== "" && mongoose.Types.ObjectId.isValid(id));
+
+        // Handle assignedBy (User ID)
+        let parsedAssignedBy = req.body.assignedBy;
+        if (!parsedAssignedBy || parsedAssignedBy === "null" || parsedAssignedBy === "undefined" || !mongoose.Types.ObjectId.isValid(parsedAssignedBy)) {
+            parsedAssignedBy = null;
+        }
+
+        // Parse department
+        let parsedDepartment = [];
+        if (req.body.department) {
+            if (typeof req.body.department === 'string') {
+                try {
+                    parsedDepartment = JSON.parse(req.body.department);
+                } catch (e) {
+                    parsedDepartment = [req.body.department];
+                }
+            } else if (Array.isArray(req.body.department)) {
+                parsedDepartment = req.body.department;
+            }
+        }
+
+        // Handle teamLead (Optional ObjectId)
+        let parsedTeamLead = req.body.teamLead;
+        if (!parsedTeamLead || parsedTeamLead === "null" || parsedTeamLead === "undefined" || !mongoose.Types.ObjectId.isValid(parsedTeamLead)) {
+            parsedTeamLead = null;
+        }
+
+        // --- STRICT MODE ASSIGNMENT LOGIC ---
+        // 1. Single: assignee = [UserIDs]
+        // 2. Department: assignee = [DeptNames]
+        // 3. Overall: assignee = []
+
+        let targetAssignee = [];
+
+        if (assignType === "Single" || assignType === "Department") {
+            targetAssignee = parsedAssignee;
+        } else if (assignType === "Overall") {
+            targetAssignee = []; // Everyone gets it
+        } else {
+            targetAssignee = [];
+        }
+
+        console.log("Creating Task Request Body:", req.body);
+        console.log("Assignee Raw:", assignee);
+        console.log("Calculated Targets (targetAssignee):", targetAssignee);
+
+        const newTask = new Task({
+            projectName,
+            taskTitle,
+            description,
+            workCategory,
+            roles: parsedRoles,
+            assignType,
+            assignee: targetAssignee, // Stores Targets
+            assignedTo: [], // Starts Empty! (Acceptance Flow)
+            projectLead: parsedProjectLead, // Use parsed value
+            department: parsedDepartment, // Added Department
+            teamLead: parsedTeamLead,     // Added Team Lead
+            assignedBy: parsedAssignedBy, // Added Assigned By
+            priority,
+            startDate,
+            startTime,
+            deadline,
+            // Handle Files
+            documentPath: req.files && req.files['documents'] ? req.files['documents'][0].filename : null,
+            audioPath: req.files && req.files['audioFile'] ? req.files['audioFile'][0].filename : null
+        });
+
+        const savedTask = await newTask.save();
+
+        // Emit real-time event
+        const io = req.app.get("io");
+        if (io) {
+            io.emit("newInvitation", savedTask); // Emit full task for Admin table & Employee list
+        }
+
+        res.status(201).json({
+            success: true,
+            message: "Task created successfully",
+            task: savedTask,
+        });
+
+    } catch (error) {
+        console.error("Error creating task:", error);
+        res.status(500).json({ success: false, message: "Server Error" });
+    }
+};
+
+// @desc    Get Invitations for a User
+// @route   GET /api/tasks/my-invitations
+// @access  Public (UserId passed as query)
+export const getInvitations = async (req, res) => {
+    try {
+        const { userId } = req.query;
+
+        if (!userId) {
+            return res.status(400).json({ message: "User ID is required" });
+        }
+
+        const user = await User.findById(userId);
+        if (!user) {
+            return res.status(404).json({ message: "User not found" });
+        }
+
+
+
+        // Logic to find matching tasks
+        // 1. Single: assignedTo == userId
+        // 2. Department: assignType="Department" && assignee maps to user.role
+        // 3. Project-wise: assignType="Project-wise" && roles includes user.role
+        // 4. Overall: assignType="Overall"
+
+        // Mapping Departments to Roles
+        // One-to-one mapping since we are selecting Roles directly as Departments
+        // Mapping Departments to Roles
+        // One-to-one mapping since we are selecting Roles directly as Departments
+        // Update to include observed roles like "Graphic Designer"
+        const deptRoleMap = {
+            "Designer": ["Designer", "Graphic Designer", "UI/UX Designer"],
+            "Social Media": ["Social Media", "Social Media Manager"],
+            "SEO Specialist": ["SEO Specialist"],
+            "Meta Ads": ["Meta Ads", "Meta Ads Specialist"],
+            "Software Developer": ["Software Developer", "Developer", "Backend Developer", "Frontend Developer"],
+            "Sales": ["Sales", "Sales Executive"],
+            "Graphic Designer": ["Graphic Designer", "Designer"] // direct mapping if Dept is named "Graphic Designer"
+        };
+        // We filter out tasks the user has *already declined*.
+        // We filter out tasks the user has *already declined*.
+        const allPending = await Task.find({
+            status: { $in: ["Pending", "In Progress"] },
+            "declinedBy.userId": { $ne: userId }
+        })
+            .populate("projectLead", "name")
+            .populate("teamLead", "name");
+
+        const myInvitations = allPending.filter(task => {
+            const isAssigned = (task.assignedTo || []).some(id => id.toString() === userId.toString());
+
+            if (task.status === "In Progress" && isAssigned) {
+                return false; // Already accepted/working on it
+            }
+
+            // --- STRICT MODE INVITATION CHECK ("Single", "Department", "Overall") ---
+
+            // 1. Overall: Everyone receives.
+            if (task.assignType === "Overall") return true;
+
+            // 2. Single: assignee array contains User ID
+            if (task.assignType === "Single") {
+                // targetAssignee stores User IDs as strings
+                const targets = task.assignee || [];
+                return targets.includes(userId.toString());
+            }
+
+            // 3. Department: assignee array contains Department Name -> Maps to Role
+            if (task.assignType === "Department") {
+                const targetDepts = task.assignee || [];
+                const roleMatch = targetDepts.some(dept => {
+                    const allowedRoles = deptRoleMap[dept] || [dept]; // Fallback to 1:1
+                    // Check if user has ANY of the allowed roles
+                    return Array.isArray(user.role)
+                        ? user.role.some(r => allowedRoles.includes(r))
+                        : allowedRoles.includes(user.role);
+                });
+                return roleMatch;
+            }
+
+            return false;
+        });
+
+        res.json(myInvitations);
+
+    } catch (error) {
+        console.error("Error fetching invitations:", error);
+        res.status(500).json({ message: "Server Error" });
+    }
+};
+
+// @desc    Respond to Task Invitation
+// @route   POST /api/tasks/:id/respond
+// @access  Public (UserId in body)
+export const respondToTask = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { userId, status, reason } = req.body; // status: "Accepted" or "Declined"
+
+        const task = await Task.findById(id);
+        if (!task) {
+            return res.status(404).json({ message: "Task not found" });
+        }
+
+        if (status === "Accepted") {
+            // Check if already assigned
+            if (task.assignedTo && task.assignedTo.length > 0) {
+                // Logic change: If Multi-assign is strictly disallowed on same task for some reason? 
+                // User request said: "When an employee accepts...". 
+                // Existing logic: task.assignedTo = userId.
+                // With Arrays (Multi-Select), assignedTo is an array.
+                // If assignType is Single or Department, multiple people can accept DIFFERENT tasks? 
+                // OR is it one shared task? 
+                // "Department" tasks: Created ONE task doc, sent to ALL. 
+                // If User A accepts, it becomes "In Progress". 
+                // Does User B still see it? 
+                // Usually Department tasks are "First to claim gets it" OR "Everyone gets a copy".
+                // Current DB structure: ONE task. 
+                // If User A accepts, task.assignedTo = [User A]. Status = "In Progress".
+                // Others will see "assignedTo" is not NULL (and not them), so they won't see it pending.
+                // This matches "First to Claim".
+
+                // However, we updated Schema to array. 
+                // `task.assignedTo` is now `[{ type: ObjectId }]`.
+                // We should push to it? Or replace if it was empty?
+                // If it was "Department", it was empty. 
+                // If one person accepts, do we want others to join? 
+                // Assuming "First Claim" for now to keep it simple as per "assignedTo != null" check in getInvitations.
+            }
+
+            // Check if user already in list (for idempotency)
+            const currentAssigned = task.assignedTo.map(id => id.toString());
+            if (!currentAssigned.includes(userId)) {
+                task.assignedTo.push(userId);
+            }
+
+            task.status = "In Progress";
+
+            // Start the first session
+            task.sessions.push({
+                startTime: new Date(),
+                endTime: null,
+                status: "In Progress",
+                reworkVersion: 0
+            });
+
+            await task.save();
+
+            // --- OFFICE SYNC INTEGRATION ---
+            // Create a branch in Office Sync Department Channel
+            if (task.department && task.department.length > 0) {
+                // Fetch user to check designation
+                const user = await User.findById(userId);
+
+                // Logic: 
+                // 1. Department Task: Only "Lead" (Tech Lead, Team Lead) triggers branch creation.
+                // 2. Single Task: Anyone triggers branch creation.
+
+                const isDepartmentTask = task.assignType === "Department";
+                // Check if designation contains "Lead" (Case insensitive)
+                const isLead = user && user.designation && user.designation.toLowerCase().includes("lead");
+
+                let shouldCreateBranch = true;
+
+                if (isDepartmentTask && !isLead) {
+                    shouldCreateBranch = false;
+                    console.log(`Skipping Office Sync Branch for Department Task. User ${user.name} is not a Lead.`);
+                }
+
+                if (shouldCreateBranch) {
+                    try {
+                        // Assuming Office Sync is running on localhost:5000 (adjust if environment var needed)
+                        // In production, use process.env.OFFICE_SYNC_URL
+                        // In production, use process.env.OFFICE_SYNC_API_URL
+                        const officeSyncBaseUrl = process.env.OFFICE_SYNC_API_URL || 'http://localhost:5000';
+                        const officeSyncUrl = `${officeSyncBaseUrl}/api/internal/create-branch`;
+
+                        const syncRes = await axios.post(officeSyncUrl, {
+                            departmentName: task.department[0], // Use first dept
+                            taskTitle: task.taskTitle,
+                            members: [userId], // Add the acceptor
+                            taskId: task._id
+                        });
+                        if (syncRes.status === 201) {
+                            console.log("Office Sync Branch Created:", syncRes.data);
+                            // Save Chat Link if returned
+                            if (syncRes.data.chatUrl) {
+                                task.chatLink = syncRes.data.chatUrl;
+                                // No need to save immediately here, task.save() is called below
+                            }
+                        }
+                    } catch (syncError) {
+                        console.error("Failed to create Office Sync branch:", syncError.message);
+                        // Do not fail the task acceptance, just log error
+                    }
+                }
+            }
+
+            await task.save(); // Save task after all modifications, including chatLink
+
+            // Emit Event for Admin
+            const user = await User.findById(userId);
+            const io = req.app.get("io");
+            if (io) {
+                io.emit("taskAccepted", {
+                    taskId: task._id,
+                    taskTitle: task.taskTitle,
+                    employeeId: userId,
+                    employeeName: user ? user.name : "Employee"
+                });
+            }
+
+            return res.json({ message: "Task accepted successfully" });
+        }
+
+        if (status === "Declined") {
+            task.declinedBy.push({
+                userId,
+                reason,
+                date: new Date()
+            });
+            // If it was a Single task, maybe update status to "Declined"? 
+            // Logic says "If employee declines -> provide reason". 
+            // If Single, it stays pending? or some specific state. For now just push to declinedBy.
+            await task.save();
+            return res.json({ message: "Task declined" });
+        }
+
+        res.status(400).json({ message: "Invalid status" });
+
+    } catch (error) {
+        console.error("Error responding to task:", error);
+        res.status(500).json({ message: "Server Error" });
+    }
+};
+
+// @desc    Get Assignments for a User (Accepted/In Progress/Completed)
+// @route   GET /api/tasks/my-tasks
+// @access  Public (UserId passed as query)
+export const getMyTasks = async (req, res) => {
+    try {
+        const { userId } = req.query;
+
+        if (!userId) {
+            return res.status(400).json({ message: "User ID is required" });
+        }
+
+        const tasks = await Task.find({
+            assignedTo: userId,
+            status: { $in: ["In Progress", "Completed", "Overdue", "Hold"] }
+        })
+            .populate("projectLead", "name")
+            .populate("teamLead", "name")
+            .populate("assignedBy", "name");
+
+        res.json(tasks);
+    } catch (error) {
+    }
+};
+
+// Helper to format 24h time
+const formatTime24 = (date) => {
+    return date.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' });
+};
+
+// Helper to format duration
+const formatDuration = (ms) => {
+    const totalMinutes = Math.floor(ms / 60000);
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    let str = "";
+    if (hours > 0) str += `${hours} hr${hours > 1 ? 's' : ''} `;
+    if (minutes > 0) str += `${minutes} min${minutes > 1 ? 's' : ''}`;
+    return str.trim() || "0 min";
+};
+
+// @desc    Update Task Status
+// @route   PUT /api/tasks/:id/status
+// @access  Public
+export const updateTaskStatus = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { status, userId } = req.body;
+
+        if (!["In Progress", "Completed", "Hold"].includes(status)) {
+            return res.status(400).json({ message: "Invalid status" });
+        }
+
+        const task = await Task.findById(id);
+        if (!task) {
+            return res.status(404).json({ message: "Task not found" });
+        }
+
+        const now = new Date();
+
+        // 1. End active session if exists (Pause timer)
+        // Find session that has startTime but NO endTime
+        const activeSession = task.sessions.find(s => !s.endTime);
+        if (activeSession) {
+            const startTime = new Date(activeSession.startTime);
+            activeSession.endTime = now;
+            activeSession.duration = now - startTime; // Calc duration ms
+
+            if (userId) {
+                try {
+                    const durationStr = formatDuration(activeSession.duration);
+                    const newLog = new WorkLog({
+                        employeeId: userId,
+                        taskTitle: task.taskTitle,
+                        projectName: task.projectName,
+                        date: now.toISOString().split('T')[0],
+                        startTime: formatTime24(startTime),
+                        endTime: formatTime24(now),
+                        duration: durationStr,
+                        timeAutomation: durationStr,
+                        status: status,
+                        description: task.description || "Auto-logged task session",
+                        taskNo: task.reworkCount,
+                        taskOwner: task.assignedBy ? task.assignedBy.toString() : "System",
+                        taskType: "Task",
+                        reworkCount: task.reworkCount
+                    });
+                    await newLog.save();
+                } catch (logError) {
+                    console.error("Error creating automated work log:", logError);
+                    // Do not block task update if log fails
+                }
+            }
+        }
+
+        // 2. Start new session if status is "In Progress" (Start timer)
+        if (status === "In Progress") {
+            task.sessions.push({
+                startTime: now,
+                endTime: null,
+                status: "In Progress",
+                reworkVersion: task.reworkCount || 0
+            });
+        }
+
+        // Note: For "Hold", we already ended the active session above. 
+        // We can optionally add a "Hold" session just for audit trail if needed,
+        // but user asked for "Hold time: ...", which implies tracking WHEN it went on hold.
+        // A closed session with endTime tracks the work period. 
+        // The gap between sessions effectively tracks the "Hold" period.
+        // But let's check user req: "Hold time: 11:15 PM... Start time 2: 11:30 PM"
+
+        // Actually, if we just end the session, we have the records.
+        // Session 1: Start 11:02 - End 11:15 (Duration 13 mins). Status: In Progress.
+        // Gaps are Hold time.
+
+        // However, if user wants explicit "Hold" logs in DB?
+        // Let's stick to tracking "Work Sessions". 
+        // A "Hold" status update just closes the current work session.
+
+        task.status = status;
+
+        // --- AUTOMATIC SESSION STOP & CHAT LINKING ---
+        if (status === "Completed") {
+            const taskIdVal = task._id;
+            console.log(`Task ${taskIdVal} completed. Checking for Session Stop...`);
+            try {
+                // Fetch User to check designation
+                const user = await User.findById(userId);
+                console.log(`Completing User: ${user ? user.name : 'Unknown'} (${userId}), Designation: ${user ? user.designation : 'N/A'}`);
+
+                let shouldEndSession = true;
+
+                // Department Task Restriction: Only Lead can end session
+                if (task.assignType === "Department") {
+                    const isLead = user && user.designation && user.designation.toLowerCase().includes("lead");
+                    console.log(`Task AssignType: Department. Is Lead? ${isLead}`);
+                    if (!isLead) {
+                        shouldEndSession = false;
+                        console.log(`Skipping Session Stop for Department Task. User ${user ? user.name : userId} is not a Lead.`);
+                    }
+                } else {
+                    console.log(`Task AssignType: ${task.assignType}. Auto-stop enabled.`);
+                }
+
+                if (shouldEndSession) {
+                    const officeSyncBaseUrl = process.env.OFFICE_SYNC_API_URL || 'http://localhost:5000';
+                    const officeSyncUrl = `${officeSyncBaseUrl}/api/internal/end-session`;
+                    console.log(`Calling Office Sync End Session: ${officeSyncUrl}`);
+
+                    // Call Office Sync
+                    const syncRes = await axios.post(officeSyncUrl, {
+                        taskId: task._id, // Send Task ID to find the branch
+                        userId: userId // Send User ID for the "Session Ended" message sender
+                    });
+
+                    console.log("Office Sync Response:", syncRes.data);
+
+                    if (syncRes.data && syncRes.data.success && syncRes.data.chatUrl) {
+                        task.chatLink = syncRes.data.chatUrl;
+                        console.log(`Session Ended & Linked: ${task.chatLink}`);
+                    }
+                }
+            } catch (syncErr) {
+                console.error("Failed to stop Office Sync session:", syncErr.message);
+                if (syncErr.response) {
+                    console.error("Sync Error Response:", syncErr.response.data);
+                }
+                // We don't fail the task update, just log it. 
+                // Optionally we could retry or alert.
+            }
+        }
+
+        await task.save();
+
+        res.json(task);
+    } catch (error) {
+        console.error("Error updating task status:", error);
+        res.status(500).json({ message: "Server Error" });
+    }
+};
+
+// @desc    Trigger Rework
+// @route   PUT /api/tasks/:id/rework
+// @access  Public
+export const reworkTask = async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        const task = await Task.findById(id);
+        if (!task) {
+            return res.status(404).json({ message: "Task not found" });
+        }
+
+        // Increment Rework Count
+        task.reworkCount = (task.reworkCount || 0) + 1;
+
+        // Set Status to In Progress
+        task.status = "In Progress";
+
+        // Start New Session for Rework
+        task.sessions.push({
+            startTime: new Date(),
+            endTime: null,
+            status: "In Progress",
+            reworkVersion: task.reworkCount
+        });
+
+        await task.save();
+        res.json(task);
+    } catch (error) {
+        console.error("Error triggering rework:", error);
+        res.status(500).json({ message: "Server Error" });
+    }
+};
+
+// @desc    Update Chat Topic
+// @route   PUT /api/tasks/:id/chat-topic
+// @access  Public
+export const updateChatTopic = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { chatTopic } = req.body;
+
+        const task = await Task.findById(id);
+        if (!task) {
+            return res.status(404).json({ message: "Task not found" });
+        }
+
+        task.chatTopic = chatTopic;
+        await task.save();
+
+        res.json(task);
+    } catch (error) {
+        console.error("Error updating chat topic:", error);
+        res.status(500).json({ message: "Server Error" });
+    }
+};
+
+// @desc    Download File
+// @route   GET /api/tasks/download/:filename
+// @access  Public
+// @desc    Get Tasks for a specific Employee (Admin View)
+// @route   GET /api/tasks/employee/:employeeId
+// @access  Public (Should be Admin)
+export const getTasksByEmployee = async (req, res) => {
+    try {
+        const { employeeId } = req.params;
+
+        // Find all tasks where assignedTo includes this employee
+        // AND status is NOT "Pending" (Assuming "Tasks" view shows active/completed work)
+        // User asked for "When an employee accepts a task... select employee... show tasks"
+        // So we probably want everything: Pending, In Progress, Completed.
+        // Actually, "In Progress" and "Completed" are the main ones. "Pending" are invitations. 
+        // Let's show everything for now.
+
+        // Fix ObjectId casting for array query
+        const tasks = await Task.find({
+            assignedTo: employeeId
+        })
+            .sort({ createdAt: -1 })
+            .populate("projectLead", "name")
+            .populate("teamLead", "name")
+            .populate("assignedBy", "name");
+
+        res.json(tasks);
+    } catch (error) {
+        console.error("Error fetching employee tasks:", error);
+        res.status(500).json({ message: "Server Error" });
+    }
+};
+
+// @desc    Get All Tasks (Admin View)
+// @route   GET /api/tasks/all
+// @access  Public (Should be Admin)
+export const getAllTasks = async (req, res) => {
+    try {
+        const tasks = await Task.find({})
+            .sort({ createdAt: -1 })
+            .populate("projectLead", "name")
+            .populate("teamLead", "name")
+            .populate("assignedBy", "name");
+        res.json(tasks);
+    } catch (error) {
+        console.error("Error fetching all tasks:", error);
+        res.status(500).json({ message: "Server Error" });
+    }
+};
+
+export const downloadFile = async (req, res) => {
+    try {
+        const { filename } = req.params;
+        const filePath = path.join(__dirname, "../../uploads", filename);
+
+        if (fs.existsSync(filePath)) {
+            res.download(filePath, filename, (err) => {
+                if (err) {
+                    console.error("Error downloading file:", err);
+                    if (!res.headersSent) {
+                        res.status(500).send("Could not download file");
+                    }
+                }
+            });
+        } else {
+            res.status(404).json({ message: "File not found" });
+        }
+    } catch (error) {
+        console.error("Error in download endpoint:", error);
+        res.status(500).json({ message: "Server Error" });
+    }
+};
+// @desc    Get Dashboard Stats
+// @route   GET /api/tasks/stats
+// @access  Public (Should be Admin)
+export const getDashboardStats = async (req, res) => {
+    try {
+        const totalProjects = (await Task.distinct("projectName")).length;
+        const totalTasks = await Task.countDocuments();
+        const pendingTasks = await Task.countDocuments({ status: "Pending" });
+        const activeTasks = await Task.countDocuments({ status: "In Progress" });
+
+        res.json({
+            totalProjects,
+            totalTasks,
+            pendingTasks,
+            activeTasks
+        });
+    } catch (error) {
+        console.error("Error fetching dashboard stats:", error);
+        res.status(500).json({ message: "Server Error" });
+    }
+};
