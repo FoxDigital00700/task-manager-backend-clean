@@ -332,7 +332,7 @@ export const respondToTask = async (req, res) => {
 
                 if (isDepartmentTask && !isLead) {
                     shouldCreateBranch = false;
-                    console.log(`Skipping Office Sync Branch for Department Task. User ${user.name} is not a Lead.`);
+                    console.log(`[Office Sync] Skipping Branch Creation for Department Task. User ${user.name} (ID: ${userId}) is not a Lead. Designation: ${user.designation}`);
                 }
 
                 if (shouldCreateBranch) {
@@ -341,6 +341,8 @@ export const respondToTask = async (req, res) => {
                         // In production, use process.env.OFFICE_SYNC_URL
                         // In production, use process.env.OFFICE_SYNC_API_URL
                         const officeSyncBaseUrl = process.env.OFFICE_SYNC_API_URL || 'http://localhost:5000';
+                        console.log(`[Office Sync] Using Office Sync URL: ${officeSyncBaseUrl}`);
+
                         const officeSyncUrl = `${officeSyncBaseUrl}/api/internal/create-branch`;
 
                         const syncRes = await axios.post(officeSyncUrl, {
@@ -350,7 +352,7 @@ export const respondToTask = async (req, res) => {
                             taskId: task._id
                         });
                         if (syncRes.status === 201) {
-                            console.log("Office Sync Branch Created:", syncRes.data);
+                            console.log("[Office Sync] Branch Created Successfully:", syncRes.data);
                             // Save Chat Link if returned
                             if (syncRes.data.chatUrl) {
                                 task.chatLink = syncRes.data.chatUrl;
@@ -358,7 +360,10 @@ export const respondToTask = async (req, res) => {
                             }
                         }
                     } catch (syncError) {
-                        console.error("Failed to create Office Sync branch:", syncError.message);
+                        console.error("[Office Sync] Failed to create branch:", syncError.message);
+                        if (syncError.response) {
+                            console.error("[Office Sync] Error Response:", syncError.response.data);
+                        }
                         // Do not fail the task acceptance, just log error
                     }
                 }
@@ -535,21 +540,21 @@ export const updateTaskStatus = async (req, res) => {
                 let shouldEndSession = true;
 
                 // Department Task Restriction: Only Lead can end session
-                if (task.assignType === "Department") {
+                if (isDepartmentTask) {
                     const isLead = user && user.designation && user.designation.toLowerCase().includes("lead");
-                    console.log(`Task AssignType: Department. Is Lead? ${isLead}`);
+                    console.log(`[Office Sync] Task AssignType: Department. Is Lead? ${isLead}`);
                     if (!isLead) {
                         shouldEndSession = false;
-                        console.log(`Skipping Session Stop for Department Task. User ${user ? user.name : userId} is not a Lead.`);
+                        console.log(`[Office Sync] Skipping Session Stop for Department Task. User ${user ? user.name : userId} is not a Lead.`);
                     }
                 } else {
-                    console.log(`Task AssignType: ${task.assignType}. Auto-stop enabled.`);
+                    console.log(`[Office Sync] Task AssignType: ${task.assignType}. Auto-stop enabled.`);
                 }
 
                 if (shouldEndSession) {
                     const officeSyncBaseUrl = process.env.OFFICE_SYNC_API_URL || 'http://localhost:5000';
                     const officeSyncUrl = `${officeSyncBaseUrl}/api/internal/end-session`;
-                    console.log(`Calling Office Sync End Session: ${officeSyncUrl}`);
+                    console.log(`[Office Sync] Calling End Session: ${officeSyncUrl}`);
 
                     // Call Office Sync
                     const syncRes = await axios.post(officeSyncUrl, {
@@ -557,17 +562,17 @@ export const updateTaskStatus = async (req, res) => {
                         userId: userId // Send User ID for the "Session Ended" message sender
                     });
 
-                    console.log("Office Sync Response:", syncRes.data);
+                    console.log("[Office Sync] Response:", syncRes.data);
 
                     if (syncRes.data && syncRes.data.success && syncRes.data.chatUrl) {
                         task.chatLink = syncRes.data.chatUrl;
-                        console.log(`Session Ended & Linked: ${task.chatLink}`);
+                        console.log(`[Office Sync] Session Ended & Linked: ${task.chatLink}`);
                     }
                 }
             } catch (syncErr) {
-                console.error("Failed to stop Office Sync session:", syncErr.message);
+                console.error("[Office Sync] Failed to stop session:", syncErr.message);
                 if (syncErr.response) {
-                    console.error("Sync Error Response:", syncErr.response.data);
+                    console.error("[Office Sync] Error Response:", syncErr.response.data);
                 }
                 // We don't fail the task update, just log it. 
                 // Optionally we could retry or alert.
